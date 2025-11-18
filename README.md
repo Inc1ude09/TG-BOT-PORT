@@ -1,4 +1,3 @@
-![Header](https://capsule-render.vercel.app/api?type=waving&color=gradient&height=120&section=header)
 💻 Разработчик Telegram-ботов
 
 Привет! Я создаю мощных Telegram-ботов с полной интеграцией в бизнес-процессы.
