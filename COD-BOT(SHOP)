@@ -1,0 +1,391 @@
+#БОТ БЕЗ ПОДКЛЮЧЕНИЯ К СЕРВЕРУ!!!
+import asyncio
+import sqlite3
+from contextlib import closing
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ================== НАСТРОЙКИ ==================
+API_TOKEN = "7940054090:AAGftTHw-7OaXtn6ag_L74AN3EQGtnbkN3U"  # <-- вставь токен бота
+CURRENCY_RATE_RUB_TO_COINS = 1   # 1₽ = 1 монета
+BANNER_IMAGE_URL = None          # Можно вставить URL картинки баннера или оставить None
+BANNER_TEXT = (
+    "🎮 <b>Добро пожаловать в магазин игровой валюты</b>\n\n"
+    "Здесь можно быстро и безопасно пополнить валюту для персонажа.\n"
+    f"💱 <b>Курс:</b> 1₽ = {CURRENCY_RATE_RUB_TO_COINS} монета\n"
+)
+
+# Список серверов (сейчас один, но легко масштабируется до 5)
+SERVERS = [
+    {"id": "server_1", "title": "🌍 Сервер #1"},
+    # {"id": "server_2", "title": "🌍 Сервер #2"},
+]
+
+DB_PATH = "game.db"
+
+# ================== БАЗА ДАННЫХ ==================
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS players (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nickname TEXT UNIQUE,
+                balance INTEGER DEFAULT 0
+            )
+        """)
+        # Тестовые игроки
+        cur.execute("INSERT OR IGNORE INTO players (nickname) VALUES (?)", ("Player1",))
+        cur.execute("INSERT OR IGNORE INTO players (nickname) VALUES (?)", ("Player2",))
+
+def get_player(nick: str):
+    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
+        cur.execute("SELECT id, nickname, balance FROM players WHERE nickname=?", (nick,))
+        return cur.fetchone()
+
+def add_currency(nick: str, amount: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
+        cur.execute("UPDATE players SET balance = balance + ? WHERE nickname=?", (amount, nick))
+
+# ================== СОСТОЯНИЕ СЕССИЙ ==================
+# Простое in-memory хранилище. Для продакшна лучше FSM/БД.
+# user_sessions[user_id] = {
+#   "main_msg_id": int,
+#   "server_id": str | None,
+#   "nick": str | None,
+#   "amount": int | None
+# }
+user_sessions = {}
+
+# ================== УТИЛИТЫ UI ==================
+def kb_main() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🗺️ Выбрать сервер", callback_data="ui_choose_server"))
+    kb.add(InlineKeyboardButton("ℹ️ Как это работает?", callback_data="ui_how"))
+    return kb
+
+def kb_servers() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    for s in SERVERS:
+        kb.add(InlineKeyboardButton(s["title"], callback_data=f"pick_server:{s['id']}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="ui_back_home"))
+    return kb
+
+def kb_after_nick_confirmed() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("💰 Ввести количество валюты", callback_data="ui_enter_amount"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="ui_choose_server"))
+    return kb
+
+def kb_ready_to_pay() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("💳 Оплатить (тест)", callback_data="pay_now_fake"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="ui_enter_amount"))
+    return kb
+
+def kb_cancel_only() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="ui_back_home"))
+    return kb
+
+async def set_or_edit_main_message(message_or_callback, html_text: str, reply_markup: InlineKeyboardMarkup = None, use_photo: bool = False):
+    """
+    Держим одно «главное» сообщение и редактируем его.
+    Если его ещё нет — отправляем. Если есть — редактируем.
+    """
+    if isinstance(message_or_callback, types.Message):
+        chat_id = message_or_callback.chat.id
+        user_id = message_or_callback.from_user.id
+    else:
+        # CallbackQuery
+        chat_id = message_or_callback.message.chat.id
+        user_id = message_or_callback.from_user.id
+
+    session = user_sessions.get(user_id, {})
+    main_msg_id = session.get("main_msg_id")
+
+    # Если нужно — отправляем картинку баннера в самом первом сообщении
+    if main_msg_id is None:
+        if use_photo and BANNER_IMAGE_URL:
+            sent = await bot.send_photo(
+                chat_id=chat_id,
+                photo=BANNER_IMAGE_URL,
+                caption=html_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        else:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=html_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        session["main_msg_id"] = sent.message_id
+        user_sessions[user_id] = session
+        return
+
+    # Пытаемся отредактировать существующее сообщение
+    try:
+        if use_photo and BANNER_IMAGE_URL:
+            # Нельзя заменить текстовый месседж на фото редактированием, поэтому просто редактируем подпись, если это фото
+            # Для простоты всегда редактируем текст (caption) у текущего сообщения
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=main_msg_id,
+                caption=html_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=main_msg_id,
+                text=html_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+    except Exception:
+        # Если сообщение не найдено/не редактируется — отправляем новое и обновляем id
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=html_text,
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+        session["main_msg_id"] = sent.message_id
+        user_sessions[user_id] = session
+
+# ================== БОТ ==================
+bot = Bot(token=API_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
+
+# -------- Команды --------
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    # Чистим команду /start (чтобы чат был чистым)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Обнуляем/создаём сессию
+    user_sessions[message.from_user.id] = {
+        "main_msg_id": None,
+        "server_id": None,
+        "nick": None,
+        "amount": None
+    }
+
+    await set_or_edit_main_message(
+        message,
+        html_text=BANNER_TEXT + "\nВыберите действие ниже 👇",
+        reply_markup=kb_main(),
+        use_photo=True  # если BANNER_IMAGE_URL указан — при первом показе выведется фото
+    )
+
+@dp.message_handler(commands=["balance"])
+async def cmd_balance(message: types.Message):
+    args = message.get_args().strip()
+    if not args:
+        await message.reply("⚠️ Использование: <code>/balance НИК</code>")
+        return
+
+    player = get_player(args)
+    if not player:
+        await message.reply("❌ Ник не найден.")
+        return
+
+    balance = player[2]
+    await message.reply(f"💰 Баланс игрока <b>{args}</b>: <b>{balance}</b> монет")
+
+# -------- Навигация (Callback) --------
+@dp.callback_query_handler(lambda c: c.data == "ui_back_home")
+async def ui_back_home(callback: types.CallbackQuery):
+    # Сбросим ввод, но оставим выбранный сервер (по желанию можно и сервер сбросить)
+    session = user_sessions.get(callback.from_user.id, {})
+    session["nick"] = None
+    session["amount"] = None
+    user_sessions[callback.from_user.id] = session
+
+    await set_or_edit_main_message(
+        callback,
+        html_text=BANNER_TEXT + "\nВыберите действие ниже 👇",
+        reply_markup=kb_main(),
+        use_photo=False
+    )
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "ui_how")
+async def ui_how(callback: types.CallbackQuery):
+    text = (
+        "🧭 <b>Как это работает</b>\n\n"
+        "1) Выбираете сервер\n"
+        "2) Вводите ник персонажа — проверяем, что он существует\n"
+        "3) Вводите количество монет (1₽ = 1 монета)\n"
+        "4) Оплачиваете (в демо — тестовая кнопка)\n"
+        "5) Валюта зачисляется на ваш аккаунт\n\n"
+        "Команда: <code>/balance НИК</code> — проверить баланс."
+    )
+    await set_or_edit_main_message(callback, text, kb_main())
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "ui_choose_server")
+async def ui_choose_server(callback: types.CallbackQuery):
+    await set_or_edit_main_message(
+        callback,
+        html_text="🌐 <b>Выберите сервер</b>:",
+        reply_markup=kb_servers()
+    )
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("pick_server:"))
+async def pick_server(callback: types.CallbackQuery):
+    server_id = callback.data.split(":")[1]
+    session = user_sessions.get(callback.from_user.id, {})
+    session["server_id"] = server_id
+    session["nick"] = None
+    session["amount"] = None
+    user_sessions[callback.from_user.id] = session
+
+    text = (
+        f"✅ Сервер выбран: <b>{server_id}</b>\n\n"
+        "Теперь введите ник персонажа.\n\n"
+        "✍️ Отправьте ник сообщением (текстом).\n\n"
+        "ℹ️ Для теста доступны: <code>Player1</code>, <code>Player2</code>"
+    )
+    await set_or_edit_main_message(callback, text, kb_cancel_only())
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "ui_enter_amount")
+async def ui_enter_amount(callback: types.CallbackQuery):
+    session = user_sessions.get(callback.from_user.id, {})
+    nick = session.get("nick")
+    if not nick:
+        await callback.answer("Сначала введите ник.", show_alert=True)
+        return
+
+    text = (
+        f"👤 Персонаж: <b>{nick}</b>\n"
+        f"💱 Курс: 1₽ = {CURRENCY_RATE_RUB_TO_COINS} монета\n\n"
+        "Введите желаемое количество монет.\n"
+        "✍️ Отправьте число сообщением (текстом).\n\n"
+        "Пример: <code>150</code>"
+    )
+    await set_or_edit_main_message(callback, text, kb_cancel_only())
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "pay_now_fake")
+async def pay_now_fake(callback: types.CallbackQuery):
+    session = user_sessions.get(callback.from_user.id, {})
+    nick = session.get("nick")
+    amount = session.get("amount")
+
+    if not nick or not amount:
+        await callback.answer("Не хватает данных (ник/сумма).", show_alert=True)
+        return
+
+    # Имитируем «успешную оплату» и зачисление
+    add_currency(nick, amount)
+
+    text = (
+        "✅ <b>Оплата прошла успешно!</b>\n\n"
+        f"💰 Зачислено: <b>{amount}</b> монет\n"
+        f"👤 Игрок: <b>{nick}</b>\n\n"
+        "Спасибо за покупку!\n\n"
+        "👉 Можете проверить баланс: <code>/balance {nick}</code>"
+    )
+    await set_or_edit_main_message(callback, text, kb_main())
+    # Сбросим переменные суммы
+    session["amount"] = None
+    user_sessions[callback.from_user.id] = session
+
+    await callback.answer("Успешно!")
+
+# -------- Обработка текстов (ввод ника / суммы) --------
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
+async def handle_text(message: types.Message):
+    user_id = message.from_user.id
+    session = user_sessions.get(user_id)
+
+    # Если нет сессии — предложим /start
+    if not session:
+        await message.reply("Нажми /start для начала.")
+        return
+
+    # Удаляем пользовательское сообщение, чтобы чат оставался чистым
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Ввод ника — если сервер выбран, а ник ещё не указан, и мы на шаге ввода ника
+    if session.get("server_id") and session.get("nick") is None:
+        nick = message.text.strip()
+        player = get_player(nick)
+        if not player:
+            txt = (
+                "❌ <b>Ник не найден</b>.\n\n"
+                "Проверьте правильность написания и попробуйте снова.\n\n"
+                "ℹ️ Для теста доступны: <code>Player1</code>, <code>Player2</code>"
+            )
+            await set_or_edit_main_message(message, txt, kb_cancel_only())
+            return
+
+        session["nick"] = nick
+        user_sessions[user_id] = session
+
+        txt = (
+            f"✅ Ник найден: <b>{nick}</b>\n\n"
+            "Теперь можно ввести количество валюты или вернуться назад.\n"
+            "Нажмите кнопку ниже, чтобы ввести сумму."
+        )
+        await set_or_edit_main_message(message, txt, kb_after_nick_confirmed())
+        return
+
+    # Ввод суммы — если ник уже есть, а сумма ещё нет
+    if session.get("nick") and session.get("amount") is None:
+        raw = message.text.replace(" ", "")
+        if not raw.isdigit():
+            await set_or_edit_main_message(
+                message,
+                "⚠️ Введите корректное <b>целое число</b> больше 0.",
+                kb_cancel_only()
+            )
+            return
+
+        amount = int(raw)
+        if amount <= 0:
+            await set_or_edit_main_message(
+                message,
+                "⚠️ Число должно быть <b>больше 0</b>.",
+                kb_cancel_only()
+            )
+            return
+
+        session["amount"] = amount
+        user_sessions[user_id] = session
+
+        total_rub = amount  # при курсе 1:1
+        txt = (
+            f"🧾 <b>Счёт к оплате (демо)</b>\n\n"
+            f"👤 Персонаж: <b>{session['nick']}</b>\n"
+            f"💰 Монеты: <b>{amount}</b>\n"
+            f"💵 К оплате: <b>{total_rub}₽</b>\n\n"
+            "Нажмите «Оплатить (тест)» чтобы имитировать оплату."
+        )
+        await set_or_edit_main_message(message, txt, kb_ready_to_pay())
+        return
+
+    # Если мы здесь — значит шаг не распознан
+    await set_or_edit_main_message(
+        message,
+        "ℹ️ Нажмите /start для начала или воспользуйтесь меню ниже.",
+        kb_main()
+    )
+
+# ================== ЗАПУСК ==================
+if __name__ == "__main__":
+    init_db()
+    print("Bot is running...")
+    executor.start_polling(dp, skip_updates=True)
+
